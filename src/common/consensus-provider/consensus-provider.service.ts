@@ -6,22 +6,21 @@ import { request } from 'undici';
 import { IncomingHttpHeaders } from 'undici/types/header';
 import BodyReadable from 'undici/types/readable';
 
-import { ConfigService } from 'common/config';
-import { range } from 'common/functions/range';
+import { ConfigService, WorkingMode } from 'common/config';
 import { rejectDelay } from 'common/functions/rejectDelay';
 import { retrier } from 'common/functions/retrier';
 import { urljoin } from 'common/functions/urljoin';
 import { PrometheusService, TrackCLRequest } from 'common/prometheus';
 import { EpochProcessingState } from 'storage/clickhouse';
 
-import { BlockCache, BlockCacheService } from './block-cache';
+import { BlockCacheService } from './block-cache';
 import { MaxDeepError, ResponseError, errCommon, errRequest } from './errors';
 import {
   BlockHeaderResponse,
   BlockInfoResponse,
-  FinalityCheckpointsResponse,
   GenesisResponse,
   ProposerDutyInfo,
+  SpecResponse,
   SyncCommitteeInfo,
   VersionResponse,
 } from './intefaces';
@@ -34,27 +33,34 @@ let ForkName: typeof import('@lodestar/params').ForkName;
 interface RequestRetryOptions {
   maxRetries?: number;
   dataOnly?: boolean;
-  useFallbackOnRejected?: (last_error: any, current_error: any) => boolean;
+  useFallbackOnRejected?: (lastError: any, currentError: any) => boolean;
   useFallbackOnResolved?: (r: any) => boolean;
+}
+
+export interface ForkEpochs {
+  deneb: number;
+  electra: number;
 }
 
 @Injectable()
 export class ConsensusProviderService {
   protected apiUrls: string[];
+  protected workingMode: string;
   protected version = '';
   protected genesisTime = 0;
-  protected defaultMaxSlotDeepCount = 32;
+  protected defaultMaxSlotDeepCount: number;
   protected latestSlot = { slot: 0, fetchTime: 0 };
+  protected forkEpochs: ForkEpochs;
 
   protected endpoints = {
     version: 'eth/v1/node/version',
     genesis: 'eth/v1/beacon/genesis',
-    beaconHeadFinalityCheckpoints: 'eth/v1/beacon/states/head/finality_checkpoints',
+    spec: 'eth/v1/config/spec',
     blockInfo: (blockId: BlockId): string => `eth/v2/beacon/blocks/${blockId}`,
     beaconHeaders: (blockId: BlockId): string => `eth/v1/beacon/headers/${blockId}`,
     attestationCommittees: (stateId: StateId, epoch: Epoch): string => `eth/v1/beacon/states/${stateId}/committees?epoch=${epoch}`,
     syncCommittee: (stateId: StateId, epoch: Epoch): string => `eth/v1/beacon/states/${stateId}/sync_committees?epoch=${epoch}`,
-    proposerDutes: (epoch: Epoch): string => `eth/v1/validator/duties/proposer/${epoch}`,
+    proposerDuties: (epoch: Epoch): string => `eth/v1/validator/duties/proposer/${epoch}`,
     state: (stateId: StateId): string => `eth/v2/debug/beacon/states/${stateId}`,
   };
 
@@ -65,6 +71,8 @@ export class ConsensusProviderService {
     protected readonly cache: BlockCacheService,
   ) {
     this.apiUrls = config.get('CL_API_URLS') as NonEmptyArray<string>;
+    this.workingMode = config.get('WORKING_MODE');
+    this.defaultMaxSlotDeepCount = config.get('CL_API_MAX_SLOT_DEEP_COUNT');
   }
 
   public async getVersion(): Promise<string> {
@@ -74,6 +82,23 @@ export class ConsensusProviderService {
     const version = (await this.retryRequest<VersionResponse>(async (apiURL: string) => this.apiGet(apiURL, this.endpoints.version)))
       .version;
     return (this.version = version);
+  }
+
+  public async getForkEpochs(): Promise<ForkEpochs> {
+    if (this.forkEpochs != null) {
+      return this.forkEpochs;
+    }
+
+    const spec = await this.retryRequest<SpecResponse>(async (apiURL: string) => this.apiGet(apiURL, this.endpoints.spec));
+    this.forkEpochs = {
+      deneb: spec.DENEB_FORK_EPOCH != null ? parseInt(spec.DENEB_FORK_EPOCH, 10) : Number.MAX_SAFE_INTEGER,
+      electra: spec.ELECTRA_FORK_EPOCH != null ? parseInt(spec.ELECTRA_FORK_EPOCH, 10) : Number.MAX_SAFE_INTEGER,
+    };
+
+    this.logger.log(`Deneb fork epoch: ${this.forkEpochs.deneb}`);
+    this.logger.log(`Electra fork epoch: ${this.forkEpochs.electra}`);
+
+    return this.forkEpochs;
   }
 
   public async getGenesisTime(): Promise<number> {
@@ -88,29 +113,23 @@ export class ConsensusProviderService {
     return (this.genesisTime = genesisTime);
   }
 
-  public async getFinalizedEpoch(): Promise<Epoch> {
-    return Number(
-      (
-        await this.retryRequest<FinalityCheckpointsResponse>(async (apiURL: string) =>
-          this.apiGet(apiURL, this.endpoints.beaconHeadFinalityCheckpoints),
-        )
-      ).finalized.epoch,
-    );
-  }
-
   public async getLatestBlockHeader(processingState: EpochProcessingState): Promise<BlockHeaderResponse | void> {
-    const latestFrom = this.config.get('WORKING_MODE');
     return await this.retryRequest<BlockHeaderResponse>(
-      async (apiURL: string) => this.apiGet(apiURL, this.endpoints.beaconHeaders(latestFrom)),
+      async (apiURL: string) => this.apiGet(apiURL, this.endpoints.beaconHeaders(this.workingMode)),
       {
         maxRetries: this.config.get('CL_API_GET_BLOCK_INFO_MAX_RETRIES'),
         useFallbackOnResolved: (r) => {
+          if (this.workingMode === WorkingMode.Finalized && r.finalized != null && !r.finalized) {
+            this.logger.error(`getLatestBlockHeader: slot [${r.data.header.message.slot}] is not finalized`);
+            return true;
+          }
+
           const nodeLatestSlot = Number(r.data.header.message.slot);
 
           if (nodeLatestSlot < this.latestSlot.slot) {
             // we assume that the node must never return a slot less than the last saved slot
             this.logger.error(
-              `Received ${latestFrom} slot [${nodeLatestSlot}] is less than last [${this.latestSlot.slot}] slot received before, but shouldn't`,
+              `Received ${this.workingMode} slot [${nodeLatestSlot}] is less than last [${this.latestSlot.slot}] slot received before, but shouldn't`,
             );
             return true;
           }
@@ -130,7 +149,7 @@ export class ConsensusProviderService {
         },
       },
     ).catch((e) => {
-      if (404 != e.$httpCode) {
+      if (e.$httpCode !== 404) {
         this.logger.error('Unexpected status code while fetching block header');
         throw e;
       }
@@ -138,8 +157,8 @@ export class ConsensusProviderService {
   }
 
   public async getBlockHeader(blockId: BlockId, ignoreCache = false): Promise<BlockHeaderResponse | void> {
-    const cached: BlockCache = this.cache.get(String(blockId));
-    if (!ignoreCache && cached && (cached.missed || cached.header)) {
+    const cached = this.cache.get(String(blockId));
+    if (!ignoreCache && cached != null && (cached.missed || cached.header)) {
       this.logger.debug(`Get ${blockId} header from blocks cache`);
       return cached.missed ? undefined : cached.header;
     }
@@ -148,16 +167,17 @@ export class ConsensusProviderService {
       async (apiURL: string) => this.apiGet(apiURL, this.endpoints.beaconHeaders(blockId)),
       {
         maxRetries: this.config.get('CL_API_GET_BLOCK_INFO_MAX_RETRIES'),
-        useFallbackOnRejected: (last_fallback_err, curr_fallback_error) => {
-          if (last_fallback_err && last_fallback_err.$httpCode == 404 && curr_fallback_error.$httpCode != 404) {
+        useFallbackOnRejected: (lastFallbackError, currFallbackError) => {
+          if (lastFallbackError != null && lastFallbackError.$httpCode === 404 && currFallbackError.$httpCode !== 404) {
             this.logger.debug('Request error from last fallback was 404, but current is not. Will be used previous error');
-            throw last_fallback_err;
+            throw lastFallbackError;
           }
+
           return true;
         },
       },
     ).catch((e) => {
-      if (404 != e.$httpCode) {
+      if (e.$httpCode !== 404) {
         this.logger.error('Unexpected status code while fetching block header');
         throw e;
       }
@@ -177,7 +197,11 @@ export class ConsensusProviderService {
    */
   public async getBeaconBlockHeaderOrPreviousIfMissed(slot: Slot): Promise<BlockHeaderResponse> {
     const header = await this.getBlockHeader(slot);
-    if (header) return header;
+
+    if (header) {
+      return header;
+    }
+
     // if block is missed, try to get next not missed block header
     const nextNotMissedHeader = await this.getNextNotMissedBlockHeader(slot + 1);
 
@@ -193,15 +217,24 @@ export class ConsensusProviderService {
   }
 
   public async getNextNotMissedBlockHeader(slot: Slot, maxDeep = this.defaultMaxSlotDeepCount): Promise<BlockHeaderResponse> {
-    const header = await this.getBlockHeader(slot);
-    if (!header) {
-      if (maxDeep < 1) {
-        throw new MaxDeepError(`Error when trying to get next not missed block header. From ${slot} to ${slot + maxDeep}`);
+    const initialMaxDeep = maxDeep;
+
+    const get = async (slot: Slot, maxDeep: number) => {
+      const header = await this.getBlockHeader(slot);
+
+      if (header == null) {
+        if (maxDeep < 1) {
+          throw new MaxDeepError(`Error when trying to get next not missed block header. From ${slot - initialMaxDeep} to ${slot}`);
+        }
+
+        this.logger.log(`Try to get next header from ${slot + 1} slot because ${slot} is missing`);
+        return await get(slot + 1, maxDeep - 1);
       }
-      this.logger.log(`Try to get next header from ${slot + 1} slot because ${slot} is missing`);
-      return await this.getNextNotMissedBlockHeader(slot + 1, maxDeep - 1);
-    }
-    return header;
+
+      return header;
+    };
+
+    return get(slot, maxDeep);
   }
 
   public async getPreviousNotMissedBlockHeader(
@@ -209,15 +242,24 @@ export class ConsensusProviderService {
     maxDeep = this.defaultMaxSlotDeepCount,
     ignoreCache = false,
   ): Promise<BlockHeaderResponse> {
-    const header = await this.getBlockHeader(slot, ignoreCache);
-    if (!header) {
-      if (maxDeep < 1) {
-        throw new MaxDeepError(`Error when trying to get previous not missed block header. From ${slot} to ${slot - maxDeep}`);
+    const initialMaxDeep = maxDeep;
+
+    const get = async (slot: Slot, maxDeep: number, ignoreCache: boolean) => {
+      const header = await this.getBlockHeader(slot, ignoreCache);
+
+      if (header == null) {
+        if (maxDeep < 1) {
+          throw new MaxDeepError(`Error when trying to get previous not missed block header. From ${slot} to ${slot - initialMaxDeep}`);
+        }
+
+        this.logger.log(`Try to get previous header from ${slot - 1} slot because ${slot} is missing`);
+        return await get(slot - 1, maxDeep - 1, ignoreCache);
       }
-      this.logger.log(`Try to get previous info from ${slot - 1} slot because ${slot} is missing`);
-      return await this.getPreviousNotMissedBlockHeader(slot - 1, maxDeep - 1);
-    }
-    return header;
+
+      return header;
+    };
+
+    return get(slot, maxDeep, ignoreCache);
   }
 
   /**
@@ -227,46 +269,6 @@ export class ConsensusProviderService {
     this.logger.log(`Getting duty dependent root for epoch ${epoch}`);
     const dutyRootSlot = epoch * this.config.get('FETCH_INTERVAL_SLOTS') - 1;
     return (await this.getPreviousNotMissedBlockHeader(dutyRootSlot, this.defaultMaxSlotDeepCount, ignoreCache)).root;
-  }
-
-  /**
-   * Trying to get nearest block with slot attestation info.
-   * Assumed that the ideal attestation is included in the next non-missed block
-   */
-  public async getBlockInfoWithSlotAttestations(
-    slot: Slot,
-    maxDeep = this.defaultMaxSlotDeepCount,
-  ): Promise<[BlockInfoResponse | undefined, Array<number>]> {
-    const nearestBlockIncludedAttestations = slot + 1; // good attestation should be included to the next block
-    let blockInfo;
-    let missedSlots: number[] = [];
-    try {
-      blockInfo = await this.getNextNotMissedBlockInfo(nearestBlockIncludedAttestations, maxDeep);
-    } catch (e) {
-      if (e instanceof MaxDeepError) {
-        this.logger.error(`Error when trying to get nearest block with attestations for slot ${slot}: from ${slot} to ${slot + maxDeep}`);
-        missedSlots = range(nearestBlockIncludedAttestations, nearestBlockIncludedAttestations + maxDeep + 1);
-      } else {
-        throw e;
-      }
-    }
-
-    if (blockInfo && nearestBlockIncludedAttestations != Number(blockInfo.message.slot)) {
-      missedSlots = range(nearestBlockIncludedAttestations, Number(blockInfo.message.slot));
-    }
-    return [blockInfo, missedSlots];
-  }
-
-  public async getNextNotMissedBlockInfo(slot: Slot, maxDeep = this.defaultMaxSlotDeepCount): Promise<BlockInfoResponse | undefined> {
-    const blockInfo = await this.getBlockInfo(slot);
-    if (!blockInfo) {
-      if (maxDeep < 1) {
-        throw new MaxDeepError(`Error when trying to get next not missed block info. From ${slot} to ${slot + maxDeep}`);
-      }
-      this.logger.log(`Try to get next info from ${slot + 1} slot because ${slot} is missing`);
-      return await this.getNextNotMissedBlockInfo(slot + 1, maxDeep - 1);
-    }
-    return blockInfo;
   }
 
   public async getState(stateId: StateId): Promise<ContainerTreeViewType<typeof anySsz.BeaconState.fields>> {
@@ -284,8 +286,8 @@ export class ConsensusProviderService {
   }
 
   public async getBlockInfo(blockId: BlockId): Promise<BlockInfoResponse | void> {
-    const cached: BlockCache = this.cache.get(String(blockId));
-    if (cached && (cached.missed || cached.info)) {
+    const cached = this.cache.get(String(blockId));
+    if (cached != null && (cached.missed || cached.info)) {
       this.logger.debug(`Get ${blockId} info from blocks cache`);
       return cached.missed ? undefined : cached.info;
     }
@@ -294,16 +296,25 @@ export class ConsensusProviderService {
       async (apiURL: string) => this.apiGet(apiURL, this.endpoints.blockInfo(blockId)),
       {
         maxRetries: this.config.get('CL_API_GET_BLOCK_INFO_MAX_RETRIES'),
-        useFallbackOnRejected: (last_fallback_err, curr_fallback_error) => {
-          if (last_fallback_err && last_fallback_err.$httpCode == 404 && curr_fallback_error.$httpCode != 404) {
-            this.logger.debug('Request error from last fallback was 404, but current is not. Will be used previous error');
-            throw last_fallback_err;
+        useFallbackOnResolved: (r) => {
+          if (this.workingMode === WorkingMode.Finalized && blockId !== 'head' && r.finalized != null && !r.finalized) {
+            this.logger.error(`getBlockInfo: slot [${r.data.message.slot}] is not finalized`);
+            return true;
           }
+
+          return false;
+        },
+        useFallbackOnRejected: (lastFallbackError, currFallbackError) => {
+          if (lastFallbackError != null && lastFallbackError.$httpCode === 404 && currFallbackError.$httpCode !== 404) {
+            this.logger.debug('Request error from last fallback was 404, but current is not. Will be used previous error');
+            throw lastFallbackError;
+          }
+
           return true;
         },
       },
     ).catch((e) => {
-      if (404 != e.$httpCode) {
+      if (e.$httpCode !== 404) {
         this.logger.error('Unexpected status code while fetching block info');
         throw e;
       }
@@ -325,7 +336,16 @@ export class ConsensusProviderService {
   }
 
   public async getSyncCommitteeInfo(stateId: StateId, epoch: Epoch): Promise<SyncCommitteeInfo> {
-    return await this.retryRequest(async (apiURL: string) => this.apiGet(apiURL, this.endpoints.syncCommittee(stateId, epoch)));
+    return await this.retryRequest(async (apiURL: string) => this.apiGet(apiURL, this.endpoints.syncCommittee(stateId, epoch)), {
+      useFallbackOnResolved: (r) => {
+        if (this.workingMode === WorkingMode.Finalized && stateId !== 'head' && r.finalized != null && !r.finalized) {
+          this.logger.error(`getSyncCommitteeInfo: state ${stateId} for epoch ${epoch} is not finalized`);
+          return true;
+        }
+
+        return false;
+      },
+    });
   }
 
   public async getCanonicalProposerDuties(epoch: Epoch, maxRetriesForGetCanonical = 3, ignoreCache = false): Promise<ProposerDutyInfo[]> {
@@ -334,7 +354,7 @@ export class ConsensusProviderService {
       const dependentRoot = await this.getDutyDependentRoot(epoch, ignoreCache);
       this.logger.log(`Proposer Duty root: ${dependentRoot}`);
       const res = <{ dependent_root: string; data: ProposerDutyInfo[] }>await this.retryRequest(
-        async (apiURL: string) => this.apiGet(apiURL, this.endpoints.proposerDutes(epoch)),
+        async (apiURL: string) => this.apiGet(apiURL, this.endpoints.proposerDuties(epoch)),
         { dataOnly: false },
       ).catch((e) => {
         this.logger.error('Unexpected status code while fetching proposer duties info');
@@ -368,7 +388,10 @@ export class ConsensusProviderService {
     let res;
     let err;
     for (let i = 0; i < this.apiUrls.length; i++) {
-      if (res) break;
+      if (res != null) {
+        break;
+      }
+
       res = await callback(this.apiUrls[i])
         .catch(rejectDelay(this.config.get('CL_API_RETRY_DELAY_MS')))
         .catch(() => retry(() => callback(this.apiUrls[i])))
@@ -377,26 +400,33 @@ export class ConsensusProviderService {
             err = Error('Unresolved data on a successful CL API response');
             return undefined;
           }
+
           return r;
         })
-        .catch((current_error: any) => {
-          if (options.useFallbackOnRejected(err, current_error)) {
-            err = current_error;
+        .catch((currentError: any) => {
+          if (options.useFallbackOnRejected(err, currentError)) {
+            err = currentError;
             return undefined;
           }
-          throw current_error;
+
+          throw currentError;
         });
-      if (i == this.apiUrls.length - 1 && !res) {
+
+      if (i === this.apiUrls.length - 1 && res == null) {
         err.message = `Error while doing CL API request on all passed URLs. ${err.message}`;
         throw err;
       }
-      if (!res) {
-        this.logger.warn(`${err.message}. Error while doing CL API request. Will try to switch to another API URL`);
+
+      if (res == null) {
+        this.logger.warn(`Error while doing CL API request. Will try to switch to another API URL. ${err.message}`);
       }
     }
 
-    if (options.dataOnly) return res.data;
-    else return res;
+    if (options.dataOnly) {
+      return res.data;
+    }
+
+    return res;
   }
 
   @TrackCLRequest
@@ -408,12 +438,15 @@ export class ConsensusProviderService {
       if (e.response) {
         throw new ResponseError(errRequest(e.response.body, subUrl, apiURL), e.response.statusCode);
       }
+
       throw new ResponseError(errCommon(e.message, subUrl, apiURL));
     });
+
     if (statusCode !== 200) {
       const errorText = await body.text();
       throw new ResponseError(errRequest(errorText, subUrl, apiURL), statusCode);
     }
+
     return (await body.json()) as T;
   }
 
@@ -431,12 +464,15 @@ export class ConsensusProviderService {
       if (e.response) {
         throw new ResponseError(errRequest(e.response.body, subUrl, apiURL), e.response.statusCode);
       }
+
       throw new ResponseError(errCommon(e.message, subUrl, apiURL));
     });
+
     if (statusCode !== 200) {
       const errorText = await body.text();
       throw new ResponseError(errRequest(errorText, subUrl, apiURL), statusCode);
     }
+
     return { body, headers };
   }
 }
